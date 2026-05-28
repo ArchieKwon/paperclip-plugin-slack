@@ -79,6 +79,104 @@ function viewButton(label: string, url: string): Record<string, unknown> {
   };
 }
 
+function truncatePlainText(text: string, max = 150): string {
+  const value = text.trim();
+  if (!value) return "";
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+type ApprovalCardMeta = {
+  approvalTypeLabel?: string;
+  agentName?: string;
+  issueIds?: string[];
+  recommendedAction?: string;
+};
+
+function approvalMetaFields(meta: ApprovalCardMeta): Array<{ type: string; text: string }> {
+  const fields: Array<{ type: string; text: string }> = [];
+  if (meta.approvalTypeLabel) {
+    fields.push({ type: "mrkdwn", text: `*유형*\n${meta.approvalTypeLabel}` });
+  }
+  if (meta.agentName) {
+    fields.push({ type: "mrkdwn", text: `*요청 에이전트*\n${meta.agentName}` });
+  }
+  if (meta.issueIds?.length) {
+    fields.push({ type: "mrkdwn", text: `*연결 이슈*\n${meta.issueIds.join(", ")}` });
+  }
+  if (meta.recommendedAction) {
+    fields.push({ type: "mrkdwn", text: `*권장 조치*\n${meta.recommendedAction}` });
+  }
+  return fields;
+}
+
+/** Card-style Block Kit layout for approval notifications. */
+function buildApprovalCardBlocks(options: {
+  headerText: string;
+  title: string;
+  description?: string | null;
+  meta: ApprovalCardMeta;
+  footerTimestamp?: string;
+  actions?: Array<Record<string, unknown>>;
+  titleAccessory?: Record<string, unknown>;
+  statusContext?: string;
+}): Array<Record<string, unknown>> {
+  const blocks: Array<Record<string, unknown>> = [
+    {
+      type: "header",
+      text: { type: "plain_text", text: truncatePlainText(options.headerText) },
+    },
+    { type: "divider" },
+  ];
+
+  if (options.statusContext) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: options.statusContext }],
+    });
+  }
+
+  const titleSection: Record<string, unknown> = {
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*제목*\n${options.title}`,
+    },
+  };
+  if (options.titleAccessory) {
+    titleSection.accessory = options.titleAccessory;
+  }
+  blocks.push(titleSection);
+
+  if (options.description) {
+    const quoted = options.description.replace(/\n/g, "\n> ");
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*요약*\n> ${quoted}`,
+      },
+    });
+  }
+
+  const fields = approvalMetaFields(options.meta);
+  if (fields.length > 0) {
+    blocks.push({ type: "section", fields });
+  }
+
+  if (options.actions?.length) {
+    blocks.push({ type: "divider" });
+    blocks.push({ type: "actions", elements: options.actions });
+  }
+
+  blocks.push(
+    options.footerTimestamp
+      ? contextFooter(options.footerTimestamp)
+      : { type: "context", elements: [{ type: "mrkdwn", text: "Paperclip" }] },
+  );
+
+  return blocks;
+}
+
 // --- Block formatting helpers ---
 
 export function formatAsBlocks(text: string, toolName?: string): SlackBlock[] {
@@ -208,42 +306,18 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
     : null;
   const issueIds = Array.isArray(p.issueIds) ? p.issueIds.map(String) : [];
 
-  const fields: Array<{ type: string; text: string }> = [];
-  if (agentName) fields.push({ type: "mrkdwn", text: `*요청 에이전트*\n${agentName}` });
-  fields.push({ type: "mrkdwn", text: `*유형*\n${labelFor(APPROVAL_TYPE_LABELS, approvalType)}` });
-  if (issueIds.length > 0) {
-    fields.push({ type: "mrkdwn", text: `*연결 이슈*\n${issueIds.join(", ")}` });
-  }
-  if (recommendedAction) {
-    fields.push({ type: "mrkdwn", text: `*권장 조치*\n${recommendedAction}` });
-  }
-
-  const bodyLines = [
-    "*승인 요청* :rotating_light:",
-    "",
-    `*제목:* ${title}`,
-  ];
-  if (description) {
-    bodyLines.push("", "*내용*", `> ${description}`);
-  }
-
-  const blocks: Array<Record<string, unknown>> = [
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: bodyLines.join("\n"),
-      },
+  const blocks = buildApprovalCardBlocks({
+    headerText: "승인 요청",
+    title,
+    description,
+    meta: {
+      approvalTypeLabel: labelFor(APPROVAL_TYPE_LABELS, approvalType),
+      agentName: agentName ?? undefined,
+      issueIds,
+      recommendedAction: recommendedAction ?? undefined,
     },
-  ];
-
-  if (fields.length > 0) {
-    blocks.push({ type: "section", fields });
-  }
-
-  blocks.push({
-    type: "actions",
-    elements: [
+    footerTimestamp: event.occurredAt,
+    actions: [
       {
         type: "button",
         text: { type: "plain_text", text: "승인" },
@@ -266,11 +340,91 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
     ],
   });
 
-  blocks.push(contextFooter(event.occurredAt));
-
   return {
     text: `승인 요청: ${title}`,
     blocks,
+  };
+}
+
+export type ApprovalResolvedContext = {
+  title?: string;
+  description?: string;
+  agentName?: string;
+  /** Raw approval type key (e.g. request_board_approval). */
+  approvalType?: string;
+  /** Localized type label parsed from Slack blocks. */
+  approvalTypeLabel?: string;
+  issueIds?: string[];
+};
+
+/** Pull approval details from the original Slack message blocks. */
+export function extractApprovalContextFromBlocks(
+  blocks: Array<Record<string, unknown>> | undefined,
+): ApprovalResolvedContext {
+  if (!blocks?.length) return {};
+
+  let title: string | undefined;
+  let description: string | undefined;
+  let agentName: string | undefined;
+  let approvalTypeLabel: string | undefined;
+  let issueIds: string[] = [];
+
+  for (const block of blocks) {
+    if (block.type === "section") {
+      const text = String((block.text as Record<string, unknown> | undefined)?.text ?? "");
+      const titleMatch = text.match(/\*제목\*?:?\*?\s*(?:\n)?(.+?)(?:\n\n|\n\*|$)/s)
+        ?? text.match(/\*제목:\*\s*(.+)/);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+      }
+
+      const contentMatch = text.match(/\*(?:요약|내용)\*\n((?:> .+(?:\n|$))+)/);
+      if (contentMatch) {
+        description = contentMatch[1]
+          .split("\n")
+          .map((line) => line.replace(/^>\s?/, ""))
+          .join("\n")
+          .trim();
+      }
+
+      const fields = block.fields as Array<Record<string, unknown>> | undefined;
+      if (fields) {
+        for (const field of fields) {
+          const fieldText = String(field.text ?? "");
+          const agentMatch = fieldText.match(/\*요청 에이전트\*\n(.+)/s);
+          if (agentMatch) {
+            agentName = agentMatch[1].trim();
+          }
+          const typeMatch = fieldText.match(/\*유형\*\n(.+)/s);
+          if (typeMatch) {
+            approvalTypeLabel = typeMatch[1].trim();
+          }
+          const issueMatch = fieldText.match(/\*연결 이슈\*\n(.+)/s);
+          if (issueMatch) {
+            issueIds = issueMatch[1]
+              .split(/,\s*/)
+              .map((id) => id.trim())
+              .filter(Boolean);
+          }
+        }
+      }
+    }
+  }
+
+  return { title, description, agentName, approvalTypeLabel, issueIds };
+}
+
+export function mergeApprovalResolvedContext(
+  fromMessage: ApprovalResolvedContext,
+  fromApi: ApprovalResolvedContext,
+): ApprovalResolvedContext {
+  return {
+    title: fromMessage.title ?? fromApi.title,
+    description: fromMessage.description ?? fromApi.description,
+    agentName: fromMessage.agentName ?? fromApi.agentName,
+    approvalType: fromMessage.approvalType ?? fromApi.approvalType,
+    approvalTypeLabel: fromMessage.approvalTypeLabel ?? fromApi.approvalTypeLabel,
+    issueIds: fromMessage.issueIds?.length ? fromMessage.issueIds : fromApi.issueIds,
   };
 }
 
@@ -278,22 +432,37 @@ export function formatApprovalResolved(
   approvalId: string,
   approved: boolean,
   userId: string,
+  context: ApprovalResolvedContext = {},
 ): SlackMessage {
   const action = approved ? "승인됨" : "거절됨";
-  const emoji = approved ? ":white_check_mark:" : ":x:";
+  const headerText = approved ? "승인 완료" : "승인 거절";
+  const title = context.title?.trim() ?? "제목 없음";
+  const description = truncate(context.description, 800);
+  const agentName = context.agentName?.trim();
+  const approvalTypeLabel = context.approvalTypeLabel?.trim()
+    ?? (context.approvalType ? labelFor(APPROVAL_TYPE_LABELS, context.approvalType) : undefined);
+  const issueIds = (context.issueIds ?? []).filter(Boolean);
+
+  const blocks = buildApprovalCardBlocks({
+    headerText,
+    title,
+    description,
+    meta: {
+      approvalTypeLabel,
+      agentName,
+      issueIds,
+    },
+    statusContext: `${approved ? ":white_check_mark:" : ":x:"} *${action}* · 처리자 <@${userId}>`,
+    titleAccessory: viewButton("보기", dashboardPath(`approvals/${approvalId}`)),
+  });
+
+  const textParts = [action];
+  if (title) textParts.push(title);
+  if (issueIds.length > 0) textParts.push(issueIds.join(", "));
 
   return {
-    text: `${action} — <@${userId}>`,
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `${emoji} *${action}* (<@${userId}>)`,
-        },
-        accessory: viewButton("보기", dashboardPath(`approvals/${approvalId}`)),
-      },
-    ],
+    text: `${textParts.join(" — ")} (<@${userId}>)`,
+    blocks,
   };
 }
 

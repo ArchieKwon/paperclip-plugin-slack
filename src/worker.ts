@@ -8,7 +8,7 @@ import {
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
+import { postMessage, respondToAction, respondEphemeral, updateMessage } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
 import { SlackAdapter } from "./adapter.js";
@@ -30,6 +30,9 @@ import {
   formatIssueDone,
   formatApprovalCreated,
   formatApprovalResolved,
+  extractApprovalContextFromBlocks,
+  mergeApprovalResolvedContext,
+  type ApprovalResolvedContext,
   formatAgentError,
   formatAgentConnected,
   formatBudgetThreshold,
@@ -57,6 +60,7 @@ let pluginCtx: PluginContext;
 let pluginToken: string;
 let pluginConfig: SlackConfig;
 let slackAdapter: SlackAdapter;
+let cachedCompanyId = "";
 
 const deliveredNotifications = new Set<string>();
 const MAX_DELIVERED_NOTIFICATIONS = 1000;
@@ -120,17 +124,52 @@ function verifySlackSignature(
 
 // --- Helpers ---
 
+function paperclipApiBase(): string {
+  return pluginConfig.paperclipBaseUrl?.replace(/\/+$/, "") ?? "http://127.0.0.1:3100";
+}
+
+function parseSlackInteractivityPayload(
+  parsedBody: Record<string, unknown> | undefined,
+): Record<string, unknown> | null {
+  if (!parsedBody) return null;
+  if (typeof parsedBody.payload === "string") {
+    try {
+      return JSON.parse(parsedBody.payload) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof parsedBody.type === "string") {
+    return parsedBody;
+  }
+  return null;
+}
+
+function resolveWebhookCompanyId(input: PluginWebhookInput): string {
+  const fromWebhook = (input as PluginWebhookInput & { companyId?: string }).companyId;
+  if (fromWebhook) return fromWebhook;
+  return cachedCompanyId;
+}
+
 async function resolveChannel(
   ctx: PluginContext,
   companyId: string,
   fallback: string,
 ): Promise<string | null> {
-  const override = await ctx.state.get({
-    scopeKind: "company",
-    scopeId: companyId,
-    stateKey: STATE_KEYS.slackChannel,
-  });
-  return (override as string) ?? fallback ?? null;
+  try {
+    const override = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: companyId,
+      stateKey: STATE_KEYS.slackChannel,
+    });
+    return (override as string) ?? fallback ?? null;
+  } catch (err) {
+    ctx.logger.warn("Could not read Slack channel override; using fallback", {
+      companyId,
+      err,
+    });
+    return fallback ?? null;
+  }
 }
 
 function parseSlashCommand(rawBody: string): {
@@ -406,6 +445,57 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
   }
 }
 
+async function fetchApprovalDisplayContext(
+  ctx: PluginContext,
+  approvalId: string,
+  baseUrl: string,
+  companyId: string,
+): Promise<ApprovalResolvedContext> {
+  const base = baseUrl.replace(/\/+$/, "");
+  try {
+    const [approvalRes, issuesRes] = await Promise.all([
+      ctx.http.fetch(`${base}/api/approvals/${approvalId}`),
+      ctx.http.fetch(`${base}/api/approvals/${approvalId}/issues`),
+    ]);
+    if (!approvalRes.ok) return {};
+
+    const approval = (await approvalRes.json()) as Record<string, unknown>;
+    const payloadData = (approval.payload ?? {}) as Record<string, unknown>;
+    const title = String(payloadData.title ?? "").trim();
+    const description = String(payloadData.summary ?? payloadData.description ?? "").trim();
+
+    let agentName: string | undefined;
+    const requestedByAgentId = approval.requestedByAgentId;
+    if (requestedByAgentId && companyId) {
+      try {
+        const agent = await ctx.agents.get(String(requestedByAgentId), companyId);
+        agentName = agent?.name ?? undefined;
+      } catch {
+        agentName = undefined;
+      }
+    }
+
+    let issueIds: string[] = [];
+    if (issuesRes.ok) {
+      const issues = (await issuesRes.json()) as Array<Record<string, unknown>>;
+      issueIds = issues
+        .map((issue) => issue.identifier ?? issue.id)
+        .filter(Boolean)
+        .map(String);
+    }
+
+    return {
+      title: title || undefined,
+      description: description || undefined,
+      agentName,
+      approvalType: approval.type ? String(approval.type) : undefined,
+      issueIds,
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function enrichApprovalEvent(
   ctx: PluginContext,
   event: PluginEvent,
@@ -442,8 +532,7 @@ async function enrichApprovalEvent(
       : [];
 
     if (issuesRes.ok) {
-      const issues = (await issuesRes.json()) as Array<Record<string, unknown>>;
-      const identifiers = issues
+      const identifiers = ((await issuesRes.json()) as Array<Record<string, unknown>>)
         .map((issue) => issue.identifier ?? issue.id)
         .filter(Boolean)
         .map(String);
@@ -493,6 +582,9 @@ const plugin = definePlugin({
     try {
       const companies = await ctx.companies.list({ limit: 1, offset: 0 });
       const companyId = companies[0]?.id;
+      if (companyId) {
+        cachedCompanyId = companyId;
+      }
       const base = config.paperclipBaseUrl?.replace(/\/+$/, "") ?? "http://127.0.0.1:3100";
       if (companyId) {
         const res = await ctx.http.fetch(`${base}/api/companies/${companyId}`);
@@ -904,16 +996,31 @@ const plugin = definePlugin({
       if (!channelId) return;
       const result = await postMessage(ctx, token, channelId, formatter(event), opts);
       if (result.ok) {
-        await ctx.activity.log({
-          companyId: event.companyId,
-          message: `Forwarded ${event.eventType} to Slack`,
-          entityType: "plugin",
-          entityId: event.entityId,
-        });
-        await ctx.metrics.write("slack.notifications.sent", 1, { event_type: event.eventType });
+        try {
+          await ctx.activity.log({
+            companyId: event.companyId,
+            message: `Forwarded ${event.eventType} to Slack`,
+            entityType: "plugin",
+            entityId: event.entityId,
+          });
+        } catch (err) {
+          ctx.logger.warn("Slack notification sent but activity.log failed", { err });
+        }
+        try {
+          await ctx.metrics.write("slack.notifications.sent", 1, { event_type: event.eventType });
+        } catch {
+          // metrics are best-effort
+        }
       } else {
         deliveredNotifications.delete(dedupeKey);
-        await ctx.metrics.write("slack.notifications.failed", 1, { event_type: event.eventType, error_code: result.error ?? "unknown" });
+        try {
+          await ctx.metrics.write("slack.notifications.failed", 1, {
+            event_type: event.eventType,
+            error_code: result.error ?? "unknown",
+          });
+        } catch {
+          // metrics are best-effort
+        }
       }
       return result;
     };
@@ -1444,17 +1551,23 @@ const plugin = definePlugin({
 
     // Interactivity (button clicks)
     if (input.endpointKey === WEBHOOK_KEYS.interactivity) {
-      const payload = body?.payload
-        ? JSON.parse(String(body.payload)) as Record<string, unknown>
-        : body;
+      const payload = parseSlackInteractivityPayload(body);
       if (!payload || payload.type !== "block_actions") return;
 
       const actions = payload.actions as Array<Record<string, unknown>>;
       const responseUrl = String(payload.response_url ?? "");
+      const channelId = String(
+        (payload.channel as Record<string, unknown> | undefined)?.id
+        ?? (payload.container as Record<string, unknown> | undefined)?.channel_id
+        ?? "",
+      );
+      const message = payload.message as Record<string, unknown> | undefined;
+      const messageTs = String(message?.ts ?? "");
+      const messageBlocks = message?.blocks as Array<Record<string, unknown>> | undefined;
       const user = payload.user as Record<string, unknown> | undefined;
       const userId = user ? String(user.id ?? user.username ?? "unknown") : "unknown";
 
-      if (!actions?.length || !responseUrl) return;
+      if (!actions?.length) return;
 
       const action = actions[0];
       const actionId = String(action.action_id ?? "");
@@ -1462,35 +1575,92 @@ const plugin = definePlugin({
 
       if (!actionValue) return;
 
-      const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-      const companyId = companies[0]?.id ?? "";
+      const refreshApprovalMessage = async (approvalId: string, approved: boolean) => {
+        const fromMessage = extractApprovalContextFromBlocks(messageBlocks);
+        const needsApi = !fromMessage.title
+          || !fromMessage.description
+          || !fromMessage.agentName
+          || !fromMessage.approvalTypeLabel
+          || !(fromMessage.issueIds?.length);
+        const fromApi = needsApi
+          ? await fetchApprovalDisplayContext(
+            pluginCtx,
+            approvalId,
+            paperclipApiBase(),
+            resolveWebhookCompanyId(input),
+          )
+          : {};
+        const context = mergeApprovalResolvedContext(fromMessage, fromApi);
+        const resolvedMessage = formatApprovalResolved(approvalId, approved, userId, context);
 
-      // --- Approval buttons ---
+        // response_url is the reliable way to replace the interactive message and clear the spinner.
+        if (responseUrl) {
+          const result = await respondToAction(pluginCtx, pluginToken, responseUrl, resolvedMessage);
+          if (result.ok) return;
+          pluginCtx.logger.warn("Slack response_url update failed, trying chat.update", {
+            error: result.error,
+            approvalId,
+          });
+        }
+        if (channelId && messageTs) {
+          await updateMessage(pluginCtx, pluginToken, channelId, messageTs, resolvedMessage);
+        }
+      };
+
+      // --- Approval buttons (no companies.list — avoids webhook invocation scope errors) ---
       if (actionId === "approval_approve" || actionId === "approval_reject") {
         const approved = actionId === "approval_approve";
         const endpoint = approved ? "approve" : "reject";
         try {
-          await pluginCtx.http.fetch(
-            `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
+          pluginCtx.logger.info("Slack approval button clicked", {
+            approvalId: actionValue,
+            endpoint,
+            slackUserId: userId,
+          });
+          const approveRes = await pluginCtx.http.fetch(
+            `${paperclipApiBase()}/api/approvals/${actionValue}/${endpoint}`,
             {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
             },
           );
+          if (!approveRes.ok) {
+            const errText = await approveRes.text().catch(() => "");
+            throw new Error(`approval ${endpoint} failed: ${approveRes.status} ${errText}`);
+          }
 
-          await respondToAction(
-            pluginCtx,
-            pluginToken,
-            responseUrl,
-            formatApprovalResolved(actionValue, approved, userId),
-          );
-          await pluginCtx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
+          await refreshApprovalMessage(actionValue, approved);
+          try {
+            await pluginCtx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
+          } catch {
+            // metrics are best-effort
+          }
         } catch (err) {
-          pluginCtx.logger.warn("Failed to handle approval action", { err, approvalId: actionValue });
+          const errMsg = err instanceof Error ? err.message : String(err);
+          pluginCtx.logger.warn("Failed to handle approval action", {
+            err: errMsg,
+            approvalId: actionValue,
+          });
+          if (responseUrl) {
+            await respondToAction(pluginCtx, pluginToken, responseUrl, {
+              text: `승인 처리 실패: ${errMsg}`,
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: `:warning: *승인 처리 실패*\n${errMsg}`,
+                  },
+                },
+              ],
+            });
+          }
         }
         return;
       }
+
+      const companyId = resolveWebhookCompanyId(input);
 
       // --- Escalation buttons ---
       if (
@@ -1616,4 +1786,10 @@ const plugin = definePlugin({
 });
 
 export default plugin;
-runWorker(plugin, import.meta.url);
+// Use argv[1] when present so runWorker's main-module check matches the host's
+// fork entrypoint (symlinked installs resolve import.meta.url to the real path).
+const workerModuleUrl =
+  typeof process.argv[1] === "string"
+    ? `file://${process.argv[1].replace(/\\/g, "/")}`
+    : import.meta.url;
+runWorker(plugin, workerModuleUrl);

@@ -4,6 +4,8 @@ import {
   formatIssueDone,
   formatApprovalCreated,
   formatApprovalResolved,
+  extractApprovalContextFromBlocks,
+  mergeApprovalResolvedContext,
   formatAgentError,
   formatAgentConnected,
   formatBudgetThreshold,
@@ -75,12 +77,30 @@ describe("formatIssueDone", () => {
 });
 
 describe("formatApprovalCreated", () => {
-  it("includes approve and reject buttons", () => {
+  it("uses card layout with header, divider, and action buttons", () => {
     const msg = formatApprovalCreated(mockEvent({
-      type: "deploy",
+      type: "request_board_approval",
       approvalId: "apr-1",
-      issueIds: ["ISS-1"],
+      title: "Deploy to production",
+      summary: "Roll out v2.1",
+      agentName: "CTO",
+      issueIds: ["DGM-1"],
+      recommendedAction: "Approve",
     }));
+    expect(msg.blocks?.[0]?.type).toBe("header");
+    expect((msg.blocks?.[0] as Record<string, unknown>).text).toEqual({
+      type: "plain_text",
+      text: "승인 요청",
+    });
+    expect(msg.blocks?.some((b: Record<string, unknown>) => b.type === "divider")).toBe(true);
+
+    const titleBlock = msg.blocks?.find(
+      (b: Record<string, unknown>) =>
+        b.type === "section"
+        && String((b.text as Record<string, unknown>)?.text ?? "").includes("*제목*"),
+    ) as Record<string, unknown>;
+    expect(String((titleBlock.text as Record<string, unknown>).text)).toContain("Deploy to production");
+
     const actionsBlock = msg.blocks?.find((b: Record<string, unknown>) => b.type === "actions");
     expect(actionsBlock).toBeDefined();
     const elements = (actionsBlock as Record<string, unknown>).elements as Array<Record<string, unknown>>;
@@ -91,31 +111,79 @@ describe("formatApprovalCreated", () => {
     expect(elements[1].style).toBe("danger");
     expect(elements[2].url).toContain("/approvals/apr-1");
   });
+});
 
-  it("shows issue count in fallback text", () => {
-    const msg = formatApprovalCreated(mockEvent({
-      type: "deploy",
-      issueIds: ["ISS-1", "ISS-2"],
-    }));
-    expect(msg.text).toContain("2 issue(s)");
+describe("extractApprovalContextFromBlocks", () => {
+  it("extracts title, summary, agent, type, and issue ids from card-style blocks", () => {
+    const context = extractApprovalContextFromBlocks([
+      { type: "header", text: { type: "plain_text", text: "승인 요청" } },
+      { type: "divider" },
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: "*제목*\n기획자 에이전트 hiring 승인 요청" },
+      },
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: "*요약*\n> DGM-15 후속 업무" },
+      },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: "*요청 에이전트*\nCTO 3" },
+          { type: "mrkdwn", text: "*유형*\n보드 승인 요청" },
+          { type: "mrkdwn", text: "*연결 이슈*\nDGM-27, DGM-28" },
+        ],
+      },
+    ]);
+    expect(context.title).toBe("기획자 에이전트 hiring 승인 요청");
+    expect(context.description).toBe("DGM-15 후속 업무");
+    expect(context.agentName).toBe("CTO 3");
+    expect(context.approvalTypeLabel).toBe("보드 승인 요청");
+    expect(context.issueIds).toEqual(["DGM-27", "DGM-28"]);
   });
 });
 
 describe("formatApprovalResolved", () => {
-  it("shows approved state", () => {
-    const msg = formatApprovalResolved("apr-1", true, "U123");
-    expect(msg.text).toContain("Approved");
-    const section = msg.blocks?.[0] as Record<string, unknown>;
-    const text = (section.text as Record<string, unknown>).text as string;
-    expect(text).toContain(":white_check_mark:");
+  it("shows approved card with preserved metadata", () => {
+    const msg = formatApprovalResolved("apr-1", true, "U123", {
+      title: "기획자 에이전트 hiring 승인 요청",
+      description: "DGM-15 후속 업무",
+      agentName: "CTO 3",
+      approvalTypeLabel: "보드 승인 요청",
+      issueIds: ["DGM-27"],
+    });
+    expect(msg.text).toContain("승인됨");
+    expect(msg.blocks?.[0]?.type).toBe("header");
+    expect((msg.blocks?.[0] as Record<string, unknown>).text).toEqual({
+      type: "plain_text",
+      text: "승인 완료",
+    });
+
+    const statusContext = msg.blocks?.find((b: Record<string, unknown>) => b.type === "context");
+    expect(String((statusContext as Record<string, unknown>).elements?.[0]?.text ?? "")).toContain("승인됨");
+
+    const titleBlock = msg.blocks?.find(
+      (b: Record<string, unknown>) =>
+        b.type === "section"
+        && String((b.text as Record<string, unknown>)?.text ?? "").includes("*제목*"),
+    ) as Record<string, unknown>;
+    expect(String((titleBlock.text as Record<string, unknown>).text)).toContain("기획자 에이전트 hiring 승인 요청");
+    expect(titleBlock.accessory).toBeDefined();
+
+    const fieldsBlock = msg.blocks?.find((b: Record<string, unknown>) => b.fields) as Record<string, unknown>;
+    const fields = fieldsBlock.fields as Array<{ text: string }>;
+    expect(fields.some((f) => f.text.includes("CTO 3"))).toBe(true);
+    expect(fields.some((f) => f.text.includes("보드 승인 요청"))).toBe(true);
+    expect(fields.some((f) => f.text.includes("DGM-27"))).toBe(true);
   });
 
-  it("shows rejected state", () => {
+  it("shows rejected card header", () => {
     const msg = formatApprovalResolved("apr-1", false, "U123");
-    expect(msg.text).toContain("Rejected");
-    const section = msg.blocks?.[0] as Record<string, unknown>;
-    const text = (section.text as Record<string, unknown>).text as string;
-    expect(text).toContain(":x:");
+    expect(msg.text).toContain("거절됨");
+    expect((msg.blocks?.[0] as Record<string, unknown>).text).toEqual({
+      type: "plain_text",
+      text: "승인 거절",
+    });
   });
 });
 
