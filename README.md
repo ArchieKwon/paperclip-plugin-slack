@@ -7,6 +7,17 @@ Slack Chat OS plugin for [Paperclip](https://github.com/paperclipai/paperclip). 
 
 Built on the Paperclip plugin SDK and the domain event bridge ([PR #909](https://github.com/paperclipai/paperclip/pull/909)).
 
+## DGMIT fork (ArchieKwon)
+
+This fork adds DGMIT-local customizations on top of upstream [mvanhorn/paperclip-plugin-slack](https://github.com/mvanhorn/paperclip-plugin-slack):
+
+- Korean Slack notification copy for channel alerts
+- Approval notifications with title + summary (API enrich)
+- Duplicate notification dedup by `eventId`
+- Company-prefixed dashboard links (`/{issuePrefix}/...`)
+
+Local deploy wrapper: `/home/dgmit/workspace/repo/paperclip-slack-ko-patches/apply.sh`
+
 ## Why this exists
 
 Multiple Paperclip users asked for notifications on the same day the plugin system shipped (2026-03-14):

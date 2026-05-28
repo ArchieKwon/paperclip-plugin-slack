@@ -5,9 +5,60 @@ import type { EscalationRecord } from "./types.js";
 type Payload = Record<string, unknown>;
 
 let dashboardBase = "http://localhost:3100";
+let companyPrefix = "";
+
+const APPROVAL_TYPE_LABELS: Record<string, string> = {
+  request_board_approval: "보드 승인 요청",
+  hire_agent: "에이전트 채용",
+  budget_override: "예산 한도 조정",
+};
+
+const RECOMMENDED_ACTION_LABELS: Record<string, string> = {
+  Approve: "승인",
+  Reject: "거절",
+};
+
+const ISSUE_STATUS_LABELS: Record<string, string> = {
+  todo: "할 일",
+  in_progress: "진행 중",
+  in_review: "검토 중",
+  done: "완료",
+  cancelled: "취소됨",
+  backlog: "백로그",
+};
+
+const ISSUE_PRIORITY_LABELS: Record<string, string> = {
+  critical: "긴급",
+  high: "높음",
+  medium: "보통",
+  low: "낮음",
+};
 
 export function setBaseUrl(url: string) {
   dashboardBase = url.replace(/\/+$/, "");
+}
+
+export function setCompanyPrefix(prefix: string) {
+  companyPrefix = String(prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+}
+
+function dashboardPath(...segments: string[]) {
+  const path = segments.filter(Boolean).join("/");
+  if (companyPrefix) {
+    return `${dashboardBase}/${companyPrefix}/${path}`;
+  }
+  return `${dashboardBase}/${path}`;
+}
+
+function labelFor(map: Record<string, string>, value: string) {
+  const key = String(value ?? "").trim();
+  return map[key] ?? key;
+}
+
+function truncate(text: unknown, max = 500): string | null {
+  const value = String(text ?? "").trim();
+  if (!value) return null;
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function contextFooter(timestamp?: string): Record<string, unknown> {
@@ -15,7 +66,7 @@ function contextFooter(timestamp?: string): Record<string, unknown> {
     { type: "mrkdwn", text: "Paperclip" },
   ];
   if (timestamp) {
-    elements.push({ type: "mrkdwn", text: `<!date^${Math.floor(new Date(timestamp).getTime() / 1000)}^{date_short_pretty} at {time}|${timestamp}>` });
+    elements.push({ type: "mrkdwn", text: `<!date^${Math.floor(new Date(timestamp).getTime() / 1000)}^{date_short_pretty} {time}|${timestamp}>` });
   }
   return { type: "context", elements };
 }
@@ -69,29 +120,35 @@ export function formatAsBlocks(text: string, toolName?: string): SlackBlock[] {
 export function formatIssueCreated(event: PluginEvent): SlackMessage {
   const p = event.payload as Payload;
   const identifier = String(p.identifier ?? event.entityId);
-  const title = String(p.title ?? "Untitled");
-  const description = p.description ? String(p.description).slice(0, 300) : null;
+  const title = String(p.title ?? "제목 없음");
+  const description = truncate(p.description, 300);
   const status = p.status ? String(p.status) : null;
   const priority = p.priority ? String(p.priority) : null;
   const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
   const projectName = p.projectName ? String(p.projectName) : null;
 
   const fields: Array<{ type: string; text: string }> = [];
-  if (status) fields.push({ type: "mrkdwn", text: `*Status*\n\`${status}\`` });
-  if (priority) fields.push({ type: "mrkdwn", text: `*Priority*\n\`${priority}\`` });
-  if (assigneeName) fields.push({ type: "mrkdwn", text: `*Assignee*\n${assigneeName}` });
-  if (projectName) fields.push({ type: "mrkdwn", text: `*Project*\n${projectName}` });
+  if (status) fields.push({ type: "mrkdwn", text: `*상태*\n\`${labelFor(ISSUE_STATUS_LABELS, status)}\`` });
+  if (priority) fields.push({ type: "mrkdwn", text: `*우선순위*\n\`${labelFor(ISSUE_PRIORITY_LABELS, priority)}\`` });
+  if (assigneeName) fields.push({ type: "mrkdwn", text: `*담당자*\n${assigneeName}` });
+  if (projectName) fields.push({ type: "mrkdwn", text: `*프로젝트*\n${projectName}` });
+
+  const bodyLines = [
+    "*새 이슈 생성*",
+    `*${identifier}* ${title}`,
+  ];
+  if (description) {
+    bodyLines.push("", "*내용*", `> ${description}`);
+  }
 
   const blocks: Array<Record<string, unknown>> = [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: description
-          ? `*New issue created*\n*${identifier}* ${title}\n> ${description}`
-          : `*New issue created*\n*${identifier}* ${title}`,
+        text: bodyLines.join("\n"),
       },
-      accessory: viewButton("View Issue", `${dashboardBase}/issues/${event.entityId}`),
+      accessory: viewButton("이슈 보기", dashboardPath(`issues/${event.entityId}`)),
     },
   ];
 
@@ -102,7 +159,7 @@ export function formatIssueCreated(event: PluginEvent): SlackMessage {
   blocks.push(contextFooter(event.occurredAt));
 
   return {
-    text: `New issue: ${identifier} - ${title}`,
+    text: `새 이슈: ${identifier} - ${title}`,
     blocks,
   };
 }
@@ -113,17 +170,17 @@ export function formatIssueDone(event: PluginEvent): SlackMessage {
   const title = String(p.title ?? "");
 
   const fields: Array<{ type: string; text: string }> = [];
-  if (p.status) fields.push({ type: "mrkdwn", text: `*Status*\n\`${String(p.status)}\`` });
-  if (p.priority) fields.push({ type: "mrkdwn", text: `*Priority*\n\`${String(p.priority)}\`` });
+  if (p.status) fields.push({ type: "mrkdwn", text: `*상태*\n\`${labelFor(ISSUE_STATUS_LABELS, String(p.status))}\`` });
+  if (p.priority) fields.push({ type: "mrkdwn", text: `*우선순위*\n\`${labelFor(ISSUE_PRIORITY_LABELS, String(p.priority))}\`` });
 
   const blocks: Array<Record<string, unknown>> = [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Issue completed* :white_check_mark:\n*${identifier}* ${title} is now done.`,
+        text: `*이슈 완료* :white_check_mark:\n*${identifier}* ${title} 작업이 완료되었습니다.`,
       },
-      accessory: viewButton("View Issue", `${dashboardBase}/issues/${event.entityId}`),
+      accessory: viewButton("이슈 보기", dashboardPath(`issues/${event.entityId}`)),
     },
   ];
 
@@ -134,7 +191,7 @@ export function formatIssueDone(event: PluginEvent): SlackMessage {
   blocks.push(contextFooter(event.occurredAt));
 
   return {
-    text: `Issue done: ${identifier}`,
+    text: `이슈 완료: ${identifier}`,
     blocks,
   };
 }
@@ -143,16 +200,31 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
   const p = event.payload as Payload;
   const approvalType = String(p.type ?? "unknown");
   const approvalId = String(p.approvalId ?? event.entityId);
-  const title = String(p.title ?? "");
-  const description = p.description ? String(p.description) : null;
+  const title = truncate(p.title, 200) ?? "제목 없음";
+  const description = truncate(p.description ?? p.summary, 800);
   const agentName = p.agentName ? String(p.agentName) : null;
-  const issueIds = Array.isArray(p.issueIds) ? p.issueIds : [];
+  const recommendedAction = p.recommendedAction
+    ? labelFor(RECOMMENDED_ACTION_LABELS, String(p.recommendedAction))
+    : null;
+  const issueIds = Array.isArray(p.issueIds) ? p.issueIds.map(String) : [];
 
   const fields: Array<{ type: string; text: string }> = [];
-  if (agentName) fields.push({ type: "mrkdwn", text: `*Agent*\n${agentName}` });
-  fields.push({ type: "mrkdwn", text: `*Type*\n\`${approvalType}\`` });
+  if (agentName) fields.push({ type: "mrkdwn", text: `*요청 에이전트*\n${agentName}` });
+  fields.push({ type: "mrkdwn", text: `*유형*\n${labelFor(APPROVAL_TYPE_LABELS, approvalType)}` });
   if (issueIds.length > 0) {
-    fields.push({ type: "mrkdwn", text: `*Linked Issues*\n${issueIds.join(", ")}` });
+    fields.push({ type: "mrkdwn", text: `*연결 이슈*\n${issueIds.join(", ")}` });
+  }
+  if (recommendedAction) {
+    fields.push({ type: "mrkdwn", text: `*권장 조치*\n${recommendedAction}` });
+  }
+
+  const bodyLines = [
+    "*승인 요청* :rotating_light:",
+    "",
+    `*제목:* ${title}`,
+  ];
+  if (description) {
+    bodyLines.push("", "*내용*", `> ${description}`);
   }
 
   const blocks: Array<Record<string, unknown>> = [
@@ -160,9 +232,7 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: description
-          ? `*Approval requested* :rotating_light:\n${title ? `*${title}*\n` : ""}${description}`
-          : `*Approval requested* :rotating_light:${title ? `\n*${title}*` : ""}`,
+        text: bodyLines.join("\n"),
       },
     },
   ];
@@ -176,23 +246,22 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
     elements: [
       {
         type: "button",
-        text: { type: "plain_text", text: "Approve" },
+        text: { type: "plain_text", text: "승인" },
         style: "primary",
         action_id: "approval_approve",
         value: approvalId,
       },
       {
         type: "button",
-        text: { type: "plain_text", text: "Reject" },
+        text: { type: "plain_text", text: "거절" },
         style: "danger",
         action_id: "approval_reject",
         value: approvalId,
       },
       {
         type: "button",
-        text: { type: "plain_text", text: "View" },
-        url: `${dashboardBase}/approvals/${approvalId}`,
-        action_id: "approval_view",
+        text: { type: "plain_text", text: "보기" },
+        url: dashboardPath(`approvals/${approvalId}`),
       },
     ],
   });
@@ -200,7 +269,7 @@ export function formatApprovalCreated(event: PluginEvent): SlackMessage {
   blocks.push(contextFooter(event.occurredAt));
 
   return {
-    text: `Approval needed (${approvalType}) for ${issueIds.length} issue(s)`,
+    text: `승인 요청: ${title}`,
     blocks,
   };
 }
@@ -210,19 +279,19 @@ export function formatApprovalResolved(
   approved: boolean,
   userId: string,
 ): SlackMessage {
-  const action = approved ? "Approved" : "Rejected";
+  const action = approved ? "승인됨" : "거절됨";
   const emoji = approved ? ":white_check_mark:" : ":x:";
 
   return {
-    text: `${action} by ${userId}`,
+    text: `${action} — <@${userId}>`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `${emoji} *${action}* by <@${userId}>`,
+          text: `${emoji} *${action}* (<@${userId}>)`,
         },
-        accessory: viewButton("View", `${dashboardBase}/approvals/${approvalId}`),
+        accessory: viewButton("보기", dashboardPath(`approvals/${approvalId}`)),
       },
     ],
   };
@@ -231,16 +300,16 @@ export function formatApprovalResolved(
 export function formatAgentError(event: PluginEvent): SlackMessage {
   const p = event.payload as Payload;
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
-  const errorMessage = String(p.error ?? p.message ?? "Unknown error");
+  const errorMessage = String(p.error ?? p.message ?? "알 수 없는 오류");
 
   return {
-    text: `Agent error: ${agentName}`,
+    text: `에이전트 오류: ${agentName}`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*Agent error* :warning:\n*${agentName}* encountered an error:\n\`\`\`${errorMessage.slice(0, 500)}\`\`\``,
+          text: `*에이전트 오류* :warning:\n*${agentName}*에서 오류가 발생했습니다.\n\`\`\`${errorMessage.slice(0, 500)}\`\`\``,
         },
       },
       contextFooter(event.occurredAt),
@@ -253,13 +322,13 @@ export function formatAgentConnected(event: PluginEvent): SlackMessage {
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
 
   return {
-    text: `Agent online: ${agentName}`,
+    text: `에이전트 연결: ${agentName}`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*Agent online* :white_check_mark:\n*${agentName}* is now connected and ready.`,
+          text: `*에이전트 연결됨* :white_check_mark:\n*${agentName}* 에이전트가 연결되어 작업 준비가 완료되었습니다.`,
         },
       },
       contextFooter(event.occurredAt),
@@ -275,13 +344,13 @@ export function formatBudgetThreshold(event: PluginEvent): SlackMessage {
   const pct = p.percentUsed != null ? String(p.percentUsed) : "?";
 
   return {
-    text: `Budget alert: ${agentName} at ${pct}%`,
+    text: `예산 알림: ${agentName} ${pct}%`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*Budget threshold reached* :chart_with_upwards_trend:\n*${agentName}* has used *${pct}%* of budget ($${spent} / $${budget})`,
+          text: `*예산 한도 도달* :chart_with_upwards_trend:\n*${agentName}* 예산의 *${pct}%*를 사용했습니다 ($${spent} / $${budget})`,
         },
       },
       contextFooter(event.occurredAt),
@@ -292,16 +361,16 @@ export function formatBudgetThreshold(event: PluginEvent): SlackMessage {
 export function formatOnboardingMilestone(event: PluginEvent): SlackMessage {
   const p = event.payload as Payload;
   const agentName = String(p.agentName ?? p.name ?? event.entityId);
-  const milestone = String(p.milestone ?? "first heartbeat");
+  const milestone = String(p.milestone ?? "첫 heartbeat");
 
   return {
-    text: `Milestone: ${agentName} - ${milestone}`,
+    text: `마일스톤: ${agentName} - ${milestone}`,
     blocks: [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*Onboarding milestone* :tada:\n*${agentName}* achieved: ${milestone}`,
+          text: `*온보딩 마일스톤* :tada:\n*${agentName}* 달성: ${milestone}`,
         },
       },
       contextFooter(event.occurredAt),

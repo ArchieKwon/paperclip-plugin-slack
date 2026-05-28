@@ -25,6 +25,7 @@ import {
 } from "./acp-bridge.js";
 import {
   setBaseUrl,
+  setCompanyPrefix,
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
@@ -56,6 +57,31 @@ let pluginCtx: PluginContext;
 let pluginToken: string;
 let pluginConfig: SlackConfig;
 let slackAdapter: SlackAdapter;
+
+const deliveredNotifications = new Set<string>();
+const MAX_DELIVERED_NOTIFICATIONS = 1000;
+
+function notificationDedupeKey(event: PluginEvent): string {
+  const eventId = String(event.eventId ?? "").trim();
+  const entityId = String(event.entityId ?? "").trim();
+  const eventType = String(event.eventType ?? "").trim();
+  const companyId = String(event.companyId ?? "").trim();
+  if (eventId) {
+    return `${companyId}|${eventType}|${eventId}`;
+  }
+  return `${companyId}|${eventType}|${entityId}|${String(event.occurredAt ?? "")}`;
+}
+
+function markNotificationDelivered(key: string): void {
+  deliveredNotifications.add(key);
+  if (deliveredNotifications.size <= MAX_DELIVERED_NOTIFICATIONS) {
+    return;
+  }
+  const oldest = deliveredNotifications.values().next().value;
+  if (oldest) {
+    deliveredNotifications.delete(oldest);
+  }
+}
 
 // --- Slack signature verification ---
 
@@ -380,6 +406,71 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
   }
 }
 
+async function enrichApprovalEvent(
+  ctx: PluginContext,
+  event: PluginEvent,
+  baseUrl: string,
+): Promise<PluginEvent> {
+  const approvalId = event.entityId;
+  if (!approvalId) return event;
+
+  const base = baseUrl.replace(/\/+$/, "");
+  try {
+    const [approvalRes, issuesRes] = await Promise.all([
+      ctx.http.fetch(`${base}/api/approvals/${approvalId}`),
+      ctx.http.fetch(`${base}/api/approvals/${approvalId}/issues`),
+    ]);
+    if (!approvalRes.ok) return event;
+
+    const approval = (await approvalRes.json()) as Record<string, unknown>;
+    const payloadData = (approval.payload ?? {}) as Record<string, unknown>;
+
+    let agentName: string | null = null;
+    const requestedByAgentId = approval.requestedByAgentId;
+    if (requestedByAgentId) {
+      try {
+        const agent = await ctx.agents.get(String(requestedByAgentId), event.companyId);
+        agentName = agent?.name ?? null;
+      } catch {
+        agentName = null;
+      }
+    }
+
+    const eventPayload = event.payload as Record<string, unknown>;
+    let issueIds = Array.isArray(eventPayload.issueIds)
+      ? eventPayload.issueIds.map(String)
+      : [];
+
+    if (issuesRes.ok) {
+      const issues = (await issuesRes.json()) as Array<Record<string, unknown>>;
+      const identifiers = issues
+        .map((issue) => issue.identifier ?? issue.id)
+        .filter(Boolean)
+        .map(String);
+      if (identifiers.length > 0) {
+        issueIds = identifiers;
+      }
+    }
+
+    return {
+      ...event,
+      payload: {
+        ...eventPayload,
+        approvalId,
+        type: approval.type ?? eventPayload.type,
+        title: payloadData.title ?? "",
+        description: payloadData.summary ?? payloadData.description ?? null,
+        recommendedAction: payloadData.recommendedAction ?? null,
+        agentName,
+        issueIds,
+      },
+    };
+  } catch (err) {
+    ctx.logger.warn("Could not enrich approval event for Slack", { approvalId, err });
+    return event;
+  }
+}
+
 // --- Plugin definition ---
 
 const plugin = definePlugin({
@@ -397,6 +488,24 @@ const plugin = definePlugin({
 
     if (config.paperclipBaseUrl) {
       setBaseUrl(config.paperclipBaseUrl);
+    }
+
+    try {
+      const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+      const companyId = companies[0]?.id;
+      const base = config.paperclipBaseUrl?.replace(/\/+$/, "") ?? "http://127.0.0.1:3100";
+      if (companyId) {
+        const res = await ctx.http.fetch(`${base}/api/companies/${companyId}`);
+        if (res.ok) {
+          const company = (await res.json()) as Record<string, unknown>;
+          const prefix = company?.issuePrefix;
+          if (prefix) {
+            setCompanyPrefix(String(prefix));
+          }
+        }
+      }
+    } catch (err) {
+      ctx.logger.warn("Could not resolve company prefix for dashboard links", { err });
     }
 
     if (!config.slackTokenRef) {
@@ -779,6 +888,17 @@ const plugin = definePlugin({
       overrideChannelId?: string,
       opts?: { threadTs?: string },
     ) => {
+      const dedupeKey = notificationDedupeKey(event);
+      if (deliveredNotifications.has(dedupeKey)) {
+        ctx.logger.debug("Skipping duplicate Slack notification", {
+          eventType: event.eventType,
+          eventId: event.eventId,
+          entityId: event.entityId,
+        });
+        return;
+      }
+      markNotificationDelivered(dedupeKey);
+
       const fallback = overrideChannelId || config.defaultChannelId;
       const channelId = await resolveChannel(ctx, event.companyId, fallback);
       if (!channelId) return;
@@ -792,6 +912,7 @@ const plugin = definePlugin({
         });
         await ctx.metrics.write("slack.notifications.sent", 1, { event_type: event.eventType });
       } else {
+        deliveredNotifications.delete(dedupeKey);
         await ctx.metrics.write("slack.notifications.failed", 1, { event_type: event.eventType, error_code: result.error ?? "unknown" });
       }
       return result;
@@ -831,7 +952,9 @@ const plugin = definePlugin({
     ctx.events.on("approval.created", async (event: PluginEvent) => {
       const live = await getConfig();
       if (!live.notifyOnApprovalCreated) return;
-      await notify(event, formatApprovalCreated, live.approvalsChannelId);
+      const base = live.paperclipBaseUrl?.replace(/\/+$/, "") ?? "http://127.0.0.1:3100";
+      const enrichedEvent = await enrichApprovalEvent(ctx, event, base);
+      await notify(enrichedEvent, formatApprovalCreated, live.approvalsChannelId);
     });
 
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
